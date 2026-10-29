@@ -596,6 +596,25 @@ _LOCAL_NAME_SHAPES: dict[str, tuple[tuple[re.Pattern[str], ...], ...]] = {
         (re.compile(r"(?<![\w.])auto\s*&{0,2}\s*\[(?P<lhs>[\w\s,]*)\]"),),
     ),
     "java": _JAVA_LAMBDA,
+    # `let`, `for` and an `Option`/`Result` pattern rebind a name; a closure's
+    # list follows `(`, `,`, `=` or `move`, so a bit-or is no closure.
+    "rust": (
+        (
+            re.compile(r"(?<![\w.])let\s+(?:mut\s+)?(?P<name>[a-z_]\w*)\b"),
+            re.compile(r"\bfor\s+(?:mut\s+)?(?P<name>[a-z_]\w*)\s+in\b"),
+            re.compile(
+                r"\blet\s+(?:Some|Ok|Err)\(\s*(?:ref\s+)?(?:mut\s+)?(?P<name>[a-z_]\w*)\s*\)"
+            ),
+            re.compile(
+                r"\b(?:Some|Ok|Err)\(\s*(?:ref\s+)?(?:mut\s+)?(?P<name>[a-z_]\w*)\s*\)"
+                r"\s*(?:if\b[^\n]*)?=>"
+            ),
+        ),
+        (
+            re.compile(r"(?:(?<=[(,=])|\bmove)\s*\|(?P<lhs>[^|\n]*)\|"),
+            re.compile(r"\b(?:let|for)\s+\((?P<lhs>[^()=\n]*)\)"),
+        ),
+    ),
     "kotlin": (
         (
             re.compile(r"(?<![\w.])va[lr]\s+(?P<name>[a-z_]\w*)"),
@@ -1181,6 +1200,7 @@ class CallAssignment(NamedTuple):
     receiver: str | None
     target: str
     # Python ``x = await f()``: an ``async def`` yields its annotation only then.
+    # Rust ``let x = f()?``: a ``Result``/``Option`` yields its ``T`` only then.
     awaited: bool = False
 
 
@@ -1205,12 +1225,21 @@ _DART_CALL_ASSIGNMENT = re.compile(
     rf"(?<![\w.])(?:final|var|const)\s+(?P<name>[a-z_]\w*)\s*=\s*(?P<awaited>await\s+)?"
     rf"(?:(?:new|const)\s+)?{_CALL_HEAD}"
 )
+# ``let x = f(..)``, ``let x = T::f(..)?``, ``let x = y.f(..).unwrap()``: a
+# path head (``T::f``, ``crate::m::f``) is the receiver the call site carries.
+_RUST_CALL_ASSIGNMENT = re.compile(
+    r"(?<![\w.])let\s+(?:mut\s+)?(?P<name>[a-z_]\w*)\s*=\s*(?:(?P<receiver>[A-Za-z_]\w*"
+    r"(?:(?:::|\.)[A-Za-z_]\w*)*)(?:::|\.))?(?P<target>[A-Za-z_]\w*)\s*\("
+)
+# What unwraps the call's ``Result``/``Option`` and still ends the statement.
+_RUST_UNWRAP = re.compile(r"[ \t]*(?:\?|\.unwrap\(\)|\.expect\((?:[^()]|\([^()]*\))*\))")
 
 _CALL_ASSIGNMENT_PATTERNS: dict[str, re.Pattern[str]] = {
     "dart": _DART_CALL_ASSIGNMENT,
     "go": _GO_CALL_DECL,
     "kotlin": _KT_CALL_ASSIGNMENT,
     "python": _PY_CALL_ASSIGNMENT,
+    "rust": _RUST_CALL_ASSIGNMENT,
     "swift": _SWIFT_CALL_ASSIGNMENT,
 }
 
@@ -1220,8 +1249,9 @@ CALL_TYPED_LANGUAGES = frozenset(_CALL_ASSIGNMENT_PATTERNS)
 _QUOTES = frozenset("\"'`")
 _STATEMENT_ENDS = frozenset("\n;}")
 # A Python ``;`` may rebind the name later on the line, where no scan sees it.
-# Dart ends a statement only at ``;``, so ``f()\n.g()`` is one statement.
-_LANGUAGE_STATEMENT_ENDS = {"python": frozenset("\n"), "dart": frozenset(";")}
+# Dart and Rust end a statement only at ``;``, so ``f()\n.g()`` is one statement.
+_LANGUAGE_STATEMENT_ENDS = {"python": frozenset("\n"), "dart": frozenset(";"), "rust": frozenset(";")}
+_NEWLINE_BLIND_LANGUAGES = frozenset({"dart", "rust"})
 # Kotlin and Swift may carry a statement onto a line that starts with a member
 # access or an operator (``.f()``, ``?: x``, ``as T``, ``&& y``). Refused
 # wholesale: a new statement starting so only costs the local its type.
@@ -1296,7 +1326,7 @@ def _ends_statement(cleaned: str, end: int, language: str, start: int = 0) -> bo
     """Does the expression ending at *end* end its statement (-1: it never ends)?"""
     if end < 0:
         return False
-    rest = cleaned[end:].lstrip(" \t\n" if language == "dart" else " \t")
+    rest = cleaned[end:].lstrip(" \t\n" if language in _NEWLINE_BLIND_LANGUAGES else " \t")
     if (
         language == "swift"
         and _SWIFT_OPTIONAL_BINDING_PREFIX.search(cleaned[:start])
@@ -1307,6 +1337,15 @@ def _ends_statement(cleaned: str, end: int, language: str, start: int = 0) -> bo
         return False
     continues = _NEXT_LINE_CONTINUES.get(language)
     return continues is None or not continues.match(rest.lstrip())
+
+
+def _rust_call_ends(cleaned: str, opened: int) -> tuple[bool, bool]:
+    """``(ends, unwrapped)`` for the Rust call whose ``(`` ends just before *opened*."""
+    end = _call_end(cleaned, opened)
+    unwrap = _RUST_UNWRAP.match(cleaned, end) if end >= 0 else None
+    if unwrap is not None:
+        end = unwrap.end()
+    return _ends_statement(cleaned, end, "rust"), unwrap is not None
 
 
 def scan_call_assignments(text: str, language: str) -> tuple[CallAssignment, ...]:
@@ -1322,7 +1361,12 @@ def scan_call_assignments(text: str, language: str) -> tuple[CallAssignment, ...
     starts = [0, *(newline.end() for newline in _NEWLINE.finditer(cleaned))]
     found: list[CallAssignment] = []
     for match in pattern.finditer(cleaned):
-        if not _call_ends_statement(cleaned, match.end(), language, match.start()):
+        awaited = bool(match.groupdict().get("awaited"))
+        if language == "rust":
+            ends, awaited = _rust_call_ends(cleaned, match.end())
+        else:
+            ends = _call_ends_statement(cleaned, match.end(), language, match.start())
+        if not ends:
             continue
         found.append(
             CallAssignment(
@@ -1330,7 +1374,7 @@ def scan_call_assignments(text: str, language: str) -> tuple[CallAssignment, ...
                 match.group("name"),
                 match.group("receiver"),
                 match.group("target"),
-                bool(match.groupdict().get("awaited")),
+                awaited,
             )
         )
     return tuple(found)
